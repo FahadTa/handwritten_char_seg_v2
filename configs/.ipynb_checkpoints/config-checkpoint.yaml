@@ -1,0 +1,175 @@
+# =============================================================================
+# Handwritten Character Segmentation v2 - Configuration
+# =============================================================================
+
+project:
+  name: "handwritten_char_seg_v2"
+  wandb_entity: "fahadtariqadmission-student"
+  wandb_project: "handwritten-char-seg-v2"
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Synthetic dataset generation
+  synthetic:
+    num_train: 12000
+    num_val: 1500
+    num_test: 1500
+    image_height: 512
+    image_width: 512
+    fonts_dir: "fonts"
+    min_font_size: 28
+    max_font_size: 48
+    lines_per_image_min: 3
+    lines_per_image_max: 7
+    text_source: "wikipedia"
+    background_color: 255
+    text_color_min: 0
+    text_color_max: 60
+
+  # Augmentation settings
+  augmentation:
+    enabled: true
+    # Slant / cursive augmentation (applied at render time)
+    slant_range_min: -0.4
+    slant_range_max: 0.4
+    # Geometric augmentations (applied via Albumentations)
+    rotation_limit: 3
+    perspective_limit: 0.05
+    elastic_alpha: 30
+    elastic_sigma: 5
+    # Morphological augmentations
+    erosion_kernel_max: 2
+    dilation_kernel_max: 2
+    # Photometric augmentations
+    brightness_limit: 0.15
+    contrast_limit: 0.15
+    gaussian_noise_var_limit: 15.0
+    gaussian_blur_limit: 3
+    # Probability of applying each augmentation
+    p_slant: 0.5
+    p_geometric: 0.5
+    p_morphological: 0.3
+    p_photometric: 0.5
+    p_noise: 0.3
+
+  # DataLoader settings
+  loader:
+    batch_size: 4
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+
+  # Paths
+  paths:
+    synthetic_root: "data/synthetic"
+    iam_root: "data/iam"
+    output_dir: "outputs"
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  # Architecture: "attention_unet" or "swin_unet"
+  architecture: "attention_unet"
+
+  # Shared settings
+  in_channels: 1
+  num_classes: 80  # 26 upper + 26 lower + 10 digits + 17 special + 1 background
+
+  # Attention U-Net specific
+  attention_unet:
+    encoder_channels: [64, 128, 256, 512, 1024]
+    dropout_rate: 0.1
+    use_batch_norm: true
+
+  # SwinUNet specific
+  swin_unet:
+    embed_dim: 96
+    depths: [2, 2, 6, 2]
+    num_heads: [3, 6, 12, 24]
+    window_size: 8
+    patch_size: 4
+    mlp_ratio: 4.0
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    drop_path_rate: 0.1
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  max_epochs: 100
+  learning_rate: 3.0e-4
+  min_learning_rate: 1.0e-6
+  weight_decay: 1.0e-4
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  # Loss function
+  loss:
+    dice_weight: 0.5
+    ce_weight: 0.5
+    class_weights_enabled: true
+    label_smoothing: 0.01
+
+  # Early stopping
+  early_stopping:
+    patience: 25
+    monitor: "val/iou"
+    mode: "max"
+
+  # Gradient management
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+
+  # Distributed training
+  accelerator: "gpu"
+  devices: 4
+  strategy: "ddp"
+  precision: "16-mixed"
+
+  # Checkpointing
+  checkpoint:
+    monitor: "val/iou"
+    mode: "max"
+    save_top_k: 3
+    save_last: true
+
+  # Logging
+  log_every_n_steps: 25
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "iou"
+    - "dice"
+    - "pixel_accuracy"
+    - "precision"
+    - "recall"
+    - "f1"
+
+  # IAM evaluation
+  iam:
+    split: "test"
+    binarization_threshold: 0.5
+    min_component_area: 10
+
+  # Domain gap analysis
+  domain_gap:
+    enabled: true
+    per_class_analysis: true
+    confusion_matrix: true
+    visualize_failures: true
+    num_visualization_samples: 20
+
+  # Visualization
+  visualization:
+    num_samples: 16
+    overlay_alpha: 0.5
+    save_format: "png"
