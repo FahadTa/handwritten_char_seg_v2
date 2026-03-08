@@ -91,6 +91,13 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of samples for prediction visualization.",
     )
+    parser.add_argument(
+        "--architecture",
+        type=str,
+        default=None,
+        choices=["attention_unet", "swin_unet"],
+        help="Override model architecture (must match the checkpoint).",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +106,10 @@ def main() -> None:
 
     # Load config
     cfg = OmegaConf.load(args.config)
+
+    # Override architecture if specified
+    if args.architecture is not None:
+        cfg.model.architecture = args.architecture
 
     iam_root = args.iam_root or cfg.data.paths.iam_root
 
@@ -119,11 +130,13 @@ def main() -> None:
     logger.info("IAM root:   %s", iam_root)
 
     # Load model
+    # strict=False handles class_weights and loss buffers saved during training
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CharSegModule.load_from_checkpoint(
         args.checkpoint,
         cfg=cfg,
         map_location=device,
+        strict=False,
     )
     model.eval()
     model.to(device)

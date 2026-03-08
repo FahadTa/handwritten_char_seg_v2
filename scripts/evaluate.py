@@ -74,6 +74,13 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of samples for prediction visualization.",
     )
+    parser.add_argument(
+        "--architecture",
+        type=str,
+        default=None,
+        choices=["attention_unet", "swin_unet"],
+        help="Override model architecture (must match the checkpoint).",
+    )
     return parser.parse_args()
 
 
@@ -84,17 +91,25 @@ def main() -> None:
     cfg = OmegaConf.load(args.config)
     cfg.data.loader.batch_size = args.batch_size
 
+    # Override architecture if specified
+    if args.architecture is not None:
+        cfg.model.architecture = args.architecture
+
     logger.info("=" * 60)
     logger.info("Synthetic Test Set Evaluation")
     logger.info("=" * 60)
     logger.info("Checkpoint: %s", args.checkpoint)
+    logger.info("Architecture: %s", cfg.model.architecture)
 
     # Load model from checkpoint
+    # strict=False handles class_weights and loss buffers that are saved
+    # in the checkpoint but not present when loading without training data
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CharSegModule.load_from_checkpoint(
         args.checkpoint,
         cfg=cfg,
         map_location=device,
+        strict=False,
     )
     model.eval()
     model.to(device)

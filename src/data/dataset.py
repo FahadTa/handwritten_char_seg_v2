@@ -185,23 +185,21 @@ def compute_class_weights(
     num_classes: int = NUM_CLASSES,
     max_samples: int = 500,
     smoothing: float = 1e-3,
+    max_weight: float = 10.0,
 ) -> torch.Tensor:
-    """Compute inverse-frequency class weights from a dataset subset.
+    """Compute sqrt-dampened inverse-frequency class weights.
 
-    Scans a random subset of the dataset to estimate pixel-level class
-    frequencies, then computes inverse-frequency weights. Classes with
-    zero frequency receive a weight of 0.0 (they are effectively ignored
-    in the loss).
-
-    The background class (index 0) receives a reduced weight because it
-    dominates the pixel count and would otherwise overwhelm character
-    class gradients.
+    Uses sqrt of inverse frequency rather than raw inverse frequency
+    to prevent extreme weight ratios between rare and common classes.
+    Weights are clamped to [0, max_weight] to prevent any single
+    class from dominating the loss.
 
     Args:
         dataset: The dataset to scan.
         num_classes: Total number of classes.
         max_samples: Maximum number of samples to scan.
         smoothing: Smoothing constant to prevent division by zero.
+        max_weight: Maximum allowed weight for any class.
 
     Returns:
         Float tensor of shape (num_classes,) with per-class weights.
@@ -218,19 +216,20 @@ def compute_class_weights(
         for cls in range(num_classes):
             counts[cls] += np.sum(mask == cls)
 
-    # Compute inverse frequency weights
+    # Compute sqrt-dampened inverse frequency weights
     total_pixels = counts.sum()
     weights = np.zeros(num_classes, dtype=np.float64)
 
     for cls in range(num_classes):
         if counts[cls] > 0:
-            weights[cls] = total_pixels / (num_classes * counts[cls] + smoothing)
+            freq = counts[cls] / total_pixels
+            weights[cls] = np.sqrt(1.0 / (freq + smoothing))
         else:
             weights[cls] = 0.0
 
     # Reduce background weight (class 0 dominates pixel counts)
     if weights[0] > 0:
-        weights[0] *= 0.1
+        weights[0] *= 0.05
 
     # Normalize so mean of non-zero weights is 1.0
     nonzero_mask = weights > 0
@@ -238,6 +237,9 @@ def compute_class_weights(
         mean_weight = weights[nonzero_mask].mean()
         if mean_weight > 0:
             weights[nonzero_mask] /= mean_weight
+
+    # Clamp to prevent extreme values
+    weights = np.clip(weights, 0.0, max_weight)
 
     return torch.tensor(weights, dtype=torch.float32)
 

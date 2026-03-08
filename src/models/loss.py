@@ -72,6 +72,11 @@ class DiceLoss(nn.Module):
     ) -> torch.Tensor:
         """Compute multiclass Dice loss.
 
+        Only averages over classes that are actually present in the
+        current batch (have at least 1 ground truth pixel). This
+        prevents absent classes from contributing a near-1.0 loss
+        that dominates the gradient signal.
+
         Args:
             logits: Raw model output of shape (B, C, H, W).
             targets: Ground truth class indices of shape (B, H, W),
@@ -86,7 +91,6 @@ class DiceLoss(nn.Module):
         probs = F.softmax(logits, dim=1)  # (B, C, H, W)
 
         # One-hot encode targets
-        # targets: (B, H, W) -> (B, C, H, W)
         targets_one_hot = F.one_hot(targets, num_classes)  # (B, H, W, C)
         targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H, W)
 
@@ -97,14 +101,18 @@ class DiceLoss(nn.Module):
 
         dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
 
-        # Exclude ignored class if specified
-        if self.ignore_index is not None and 0 <= self.ignore_index < num_classes:
-            mask = torch.ones(num_classes, device=logits.device, dtype=torch.bool)
-            mask[self.ignore_index] = False
-            dice_per_class = dice_per_class[mask]
+        # Build mask: exclude ignored class AND classes absent from this batch
+        gt_pixel_counts = torch.sum(targets_one_hot, dim=dims)  # (C,)
+        present_mask = gt_pixel_counts > 0
 
-        # Macro average
-        dice_loss = 1.0 - dice_per_class.mean()
+        if self.ignore_index is not None and 0 <= self.ignore_index < num_classes:
+            present_mask[self.ignore_index] = False
+
+        # Average only over present classes
+        if present_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        dice_loss = 1.0 - dice_per_class[present_mask].mean()
 
         return dice_loss
 
