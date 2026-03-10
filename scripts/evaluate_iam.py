@@ -98,6 +98,13 @@ def parse_args() -> argparse.Namespace:
         choices=["attention_unet", "swin_unet"],
         help="Override model architecture (must match the checkpoint).",
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        choices=["train", "val", "test"],
+        help="Override IAM split to evaluate on (default: from config).",
+    )
     return parser.parse_args()
 
 
@@ -146,10 +153,10 @@ def main() -> None:
                 model.model.get_num_parameters())
 
     # Set up IAM data
+    iam_split = args.split or cfg.evaluation.iam.split
     iam_loader, iam_dataset = create_iam_dataloader(
         iam_root=iam_root,
-        split=cfg.evaluation.iam.split,
-        mode="lines",
+        split=iam_split,
         batch_size=args.batch_size,
         num_workers=4,
         image_height=cfg.data.synthetic.image_height,

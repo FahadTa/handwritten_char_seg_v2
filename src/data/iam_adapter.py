@@ -3,34 +3,36 @@
 # =============================================================================
 # Adapter for the IAM Handwriting Database to enable real-data evaluation.
 #
-# The IAM database structure:
-#   iam_root/
-#       img/                  # Line or word images
-#       xml/                  # XML annotations with transcriptions
-#       ascii/                # Text transcription files
-#       split/                # Train/val/test split definitions
+# Expected directory structure:
+#   data/iam/
+#       lines/              # Line-level images
+#           a01/
+#               a01-000u/
+#                   a01-000u-00.png
+#                   ...
+#       ascii/
+#           lines.txt       # Line transcriptions
+#       split/
+#           trainset.txt
+#           validationset1.txt
+#           validationset2.txt
+#           testset.txt
+#
+# Transcription format in lines.txt:
+#   a01-000u-00 ok 154 19 408 746 1661 89 A|MOVE|to|stop|Mr.|Gaitskell|from
+#   Fields: line_id, segmentation_result, graylevel, num_components,
+#           x, y, w, h, transcription (words separated by |)
 #
 # This adapter:
-#   1. Loads IAM line/word images
-#   2. Generates pseudo ground-truth segmentation masks by:
-#      a. Binarizing the real handwriting image (Otsu threshold)
-#      b. Using the transcription to assign class labels
-#      c. Using connected component analysis to segment individual
-#         characters from left to right
-#      d. Matching components to transcription characters sequentially
-#   3. Resizes everything to the model's expected input resolution
-#   4. Provides a Dataset interface compatible with our evaluation code
-#
-# IMPORTANT: The generated masks are pseudo ground-truth. Real handwriting
-# does not have pixel-perfect character-level annotations. The masks are
-# approximate and intended for domain-gap analysis, not for computing
-# absolute accuracy numbers on real data. The evaluation report will
-# clearly state this limitation.
+#   1. Parses lines.txt to get transcriptions
+#   2. Loads line images
+#   3. Generates pseudo ground-truth segmentation masks via
+#      binarization + connected component analysis
+#   4. Provides a Dataset interface compatible with evaluation code
 # =============================================================================
 
 import logging
 import os
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -45,69 +47,62 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# IAM XML Parsing
+# IAM Lines.txt Parsing
 # =============================================================================
 
-def parse_iam_xml(xml_path: str) -> Dict[str, Dict]:
-    """Parse an IAM XML annotation file to extract line-level information.
+def parse_lines_txt(lines_txt_path: str) -> Dict[str, Dict]:
+    """Parse the IAM lines.txt transcription file.
 
     Args:
-        xml_path: Path to the XML file.
+        lines_txt_path: Path to the lines.txt file.
 
     Returns:
-        Dictionary mapping line IDs to their metadata:
+        Dictionary mapping line IDs to metadata:
             {
-                line_id: {
-                    'text': transcription string,
-                    'words': [
-                        {'text': word_str, 'x': int, 'y': int,
-                         'w': int, 'h': int},
-                        ...
-                    ]
-                }
+                'a01-000u-00': {
+                    'status': 'ok',
+                    'graylevel': 154,
+                    'text': 'A MOVE to stop Mr. Gaitskell from',
+                    'bbox': (408, 746, 1661, 89),
+                },
+                ...
             }
     """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
     lines = {}
 
-    for line_elem in root.iter("line"):
-        line_id = line_elem.get("id", "")
-        line_text = line_elem.get("text", "")
+    with open(lines_txt_path, "r") as f:
+        for raw_line in f:
+            raw_line = raw_line.strip()
 
-        # Unescape common XML entities in IAM transcriptions
-        line_text = line_text.replace("&amp;", "&")
-        line_text = line_text.replace("&quot;", '"')
-        line_text = line_text.replace("&apos;", "'")
-        line_text = line_text.replace("&lt;", "<")
-        line_text = line_text.replace("&gt;", ">")
+            # Skip comments and empty lines
+            if not raw_line or raw_line.startswith("#"):
+                continue
 
-        words = []
-        for word_elem in line_elem.iter("word"):
-            word_text = word_elem.get("text", "")
-            word_text = word_text.replace("&amp;", "&")
-            word_text = word_text.replace("&quot;", '"')
-            word_text = word_text.replace("&apos;", "'")
+            parts = raw_line.split(" ")
+            if len(parts) < 9:
+                continue
 
-            # Bounding box (may not always be present)
-            x = int(word_elem.get("x", 0))
-            y = int(word_elem.get("y", 0))
-            w = int(word_elem.get("w", 0))
-            h = int(word_elem.get("h", 0))
+            line_id = parts[0]
+            status = parts[1]
+            graylevel = int(parts[2])
+            # parts[3] = num_components
+            x = int(parts[4])
+            y = int(parts[5])
+            w = int(parts[6])
+            h = int(parts[7])
 
-            words.append({
-                "text": word_text,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-            })
+            # Transcription: words separated by |, rejoin with spaces
+            transcription_raw = " ".join(parts[8:])
+            transcription = transcription_raw.replace("|", " ")
 
-        lines[line_id] = {
-            "text": line_text,
-            "words": words,
-        }
+            lines[line_id] = {
+                "status": status,
+                "graylevel": graylevel,
+                "text": transcription,
+                "bbox": (x, y, w, h),
+            }
 
+    logger.info("Parsed %d lines from %s", len(lines), lines_txt_path)
     return lines
 
 
@@ -115,11 +110,9 @@ def load_iam_splits(split_dir: str) -> Dict[str, List[str]]:
     """Load IAM train/val/test split definitions.
 
     The split files contain form IDs (e.g., 'a01-000u') one per line.
-    These are used to determine which lines belong to which split.
 
     Args:
-        split_dir: Directory containing split files (trainset.txt,
-                   validationset1.txt, testset.txt, etc.).
+        split_dir: Directory containing split files.
 
     Returns:
         Dictionary mapping split name to list of form IDs.
@@ -165,15 +158,6 @@ def generate_pseudo_mask(
         3. Sort components left-to-right (with line grouping)
         4. Map components to transcription characters sequentially
 
-    This is approximate because:
-        - Connected components may merge touching characters
-        - Components may split a single character (e.g., dotted 'i')
-        - The sequential mapping assumes left-to-right reading order
-
-    These limitations are acceptable for domain-gap analysis, where
-    we care about relative performance degradation rather than
-    absolute accuracy.
-
     Args:
         image: Grayscale image of handwritten text, shape (H, W).
         transcription: The text content of the image.
@@ -205,33 +189,25 @@ def generate_pseudo_mask(
 
     # Step 3: Filter small components and sort by position
     components = []
-    for label_idx in range(1, num_labels):  # skip background (0)
+    for label_idx in range(1, num_labels):
         area = stats[label_idx, cv2.CC_STAT_AREA]
         if area < min_component_area:
             continue
 
         cx = centroids[label_idx][0]
         cy = centroids[label_idx][1]
-        x = stats[label_idx, cv2.CC_STAT_LEFT]
-        y = stats[label_idx, cv2.CC_STAT_TOP]
-        comp_w = stats[label_idx, cv2.CC_STAT_WIDTH]
-        comp_h = stats[label_idx, cv2.CC_STAT_HEIGHT]
 
         components.append({
             "label": label_idx,
             "cx": cx,
             "cy": cy,
-            "x": x,
-            "y": y,
-            "w": comp_w,
-            "h": comp_h,
             "area": area,
         })
 
     if not components:
         return mask
 
-    # Group components into lines by vertical position
+    # Group components into lines by vertical position and sort
     components = _group_and_sort_components(components, h)
 
     # Step 4: Extract non-space characters from transcription
@@ -250,9 +226,6 @@ def generate_pseudo_mask(
         component_pixels = labels == comp["label"]
         mask[component_pixels] = class_idx
 
-    # Any remaining components beyond the transcription length
-    # are left as background (0)
-
     return mask
 
 
@@ -262,11 +235,6 @@ def _group_and_sort_components(
     line_threshold_ratio: float = 0.03,
 ) -> List[Dict]:
     """Group components into text lines and sort left-to-right within lines.
-
-    Components are grouped by their vertical centroid. Components whose
-    centroids are within a threshold distance vertically are considered
-    to be on the same line. Lines are sorted top-to-bottom, and
-    components within each line are sorted left-to-right.
 
     Args:
         components: List of component dictionaries with 'cx', 'cy' keys.
@@ -312,17 +280,12 @@ class IAMDataset(Dataset):
 
     Loads IAM line images, generates pseudo ground-truth masks from
     transcriptions, and resizes to model input dimensions.
-
-    Supports two modes:
-        1. 'lines': Load line-level images from the IAM lines/ directory
-        2. 'words': Load word-level images from the IAM words/ directory
     """
 
     def __init__(
         self,
         iam_root: str,
         split: str = "test",
-        mode: str = "lines",
         image_height: int = 512,
         image_width: int = 512,
         binarization_threshold: Optional[int] = None,
@@ -334,7 +297,6 @@ class IAMDataset(Dataset):
         Args:
             iam_root: Root directory of the IAM database.
             split: Which split to use ('train', 'val', 'test').
-            mode: 'lines' or 'words'.
             image_height: Target image height.
             image_width: Target image width.
             binarization_threshold: Threshold for mask generation.
@@ -343,7 +305,6 @@ class IAMDataset(Dataset):
         """
         self._iam_root = Path(iam_root)
         self._split = split
-        self._mode = mode
         self._image_height = image_height
         self._image_width = image_width
         self._binarization_threshold = binarization_threshold
@@ -353,77 +314,75 @@ class IAMDataset(Dataset):
         self._load_samples(max_samples)
 
     def _load_samples(self, max_samples: Optional[int] = None) -> None:
-        """Discover and load sample metadata from the IAM database.
-
-        Scans XML files to find lines/words in the requested split,
-        then verifies that the corresponding image files exist.
-        """
-        xml_dir = self._iam_root / "xml"
-        img_base_dir = self._iam_root / self._mode
-
-        if not xml_dir.exists():
-            logger.warning("IAM xml directory not found: %s", xml_dir)
-            return
-
-        if not img_base_dir.exists():
-            logger.warning("IAM image directory not found: %s", img_base_dir)
-            return
-
-        # Load split definitions if available
+        """Discover and load sample metadata from the IAM database."""
+        lines_dir = self._iam_root / "lines"
+        lines_txt = self._iam_root / "ascii" / "lines.txt"
         split_dir = self._iam_root / "split"
+
+        if not lines_dir.exists():
+            logger.warning("IAM lines directory not found: %s", lines_dir)
+            return
+
+        if not lines_txt.exists():
+            logger.warning("IAM lines.txt not found: %s", lines_txt)
+            return
+
+        # Parse transcriptions
+        all_lines = parse_lines_txt(str(lines_txt))
+
+        # Load split definitions
         split_forms = None
         if split_dir.exists():
             splits = load_iam_splits(str(split_dir))
             split_forms = set(splits.get(self._split, []))
+            logger.info(
+                "Split '%s' has %d forms",
+                self._split,
+                len(split_forms) if split_forms else 0,
+            )
 
-        # Parse all XML files
-        for xml_file in sorted(xml_dir.glob("*.xml")):
-            form_id = xml_file.stem
-
-            # Filter by split if split info is available
-            if split_forms is not None and form_id not in split_forms:
+        # Match line images with transcriptions
+        for line_id, line_info in all_lines.items():
+            transcription = line_info["text"]
+            if not transcription.strip():
                 continue
 
-            try:
-                lines = parse_iam_xml(str(xml_file))
-            except ET.ParseError:
-                logger.warning("Failed to parse XML: %s", xml_file)
+            # Line ID format: a01-000u-00
+            parts = line_id.split("-")
+            if len(parts) < 3:
                 continue
 
-            for line_id, line_info in lines.items():
-                transcription = line_info["text"]
-                if not transcription.strip():
+            form_id = f"{parts[0]}-{parts[1]}"
+
+            # Check if this line belongs to the requested split
+            # Split files may contain either line IDs (e.g., m01-049-00)
+            # or form IDs (e.g., a01-000u). Check both.
+            if split_forms is not None:
+                if line_id not in split_forms and form_id not in split_forms:
                     continue
 
-                # Construct image path following IAM directory structure
-                # IAM lines path: lines/a01/a01-000u/a01-000u-00.png
-                parts = line_id.split("-")
-                if len(parts) < 3:
-                    continue
+            # Construct image path: lines/a01/a01-000u/a01-000u-00.png
+            subdir1 = parts[0]
+            subdir2 = form_id
+            img_filename = f"{line_id}.png"
+            img_path = lines_dir / subdir1 / subdir2 / img_filename
 
-                subdir1 = parts[0]
-                subdir2 = f"{parts[0]}-{parts[1]}"
-                img_filename = f"{line_id}.png"
-                img_path = img_base_dir / subdir1 / subdir2 / img_filename
+            if not img_path.exists():
+                continue
 
-                if not img_path.exists():
-                    continue
-
-                self._samples.append({
-                    "image_path": str(img_path),
-                    "transcription": transcription,
-                    "line_id": line_id,
-                })
-
-                if max_samples and len(self._samples) >= max_samples:
-                    break
+            self._samples.append({
+                "image_path": str(img_path),
+                "transcription": transcription,
+                "line_id": line_id,
+                "graylevel": line_info.get("graylevel", None),
+            })
 
             if max_samples and len(self._samples) >= max_samples:
                 break
 
         logger.info(
-            "IAM dataset (%s, %s): loaded %d samples",
-            self._split, self._mode, len(self._samples),
+            "IAM dataset (%s): loaded %d samples",
+            self._split, len(self._samples),
         )
 
     def __len__(self) -> int:
@@ -431,6 +390,9 @@ class IAMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Load an IAM sample with pseudo ground-truth mask.
+
+        If an image cannot be loaded, returns a blank sample instead
+        of crashing the DataLoader.
 
         Returns:
             Dictionary with keys:
@@ -441,30 +403,41 @@ class IAMDataset(Dataset):
         """
         sample = self._samples[idx]
 
-        # Load grayscale image
-        image = cv2.imread(sample["image_path"], cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise IOError(f"Failed to load: {sample['image_path']}")
+        try:
+            # Load grayscale image
+            image = cv2.imread(sample["image_path"], cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise IOError(f"Failed to load: {sample['image_path']}")
 
-        # Generate pseudo ground-truth mask
-        mask = generate_pseudo_mask(
-            image=image,
-            transcription=sample["transcription"],
-            binarization_threshold=self._binarization_threshold,
-            min_component_area=self._min_component_area,
-        )
+            # Generate pseudo ground-truth mask
+            mask = generate_pseudo_mask(
+                image=image,
+                transcription=sample["transcription"],
+                binarization_threshold=self._binarization_threshold,
+                min_component_area=self._min_component_area,
+            )
 
-        # Resize to model input dimensions
-        image = cv2.resize(
-            image,
-            (self._image_width, self._image_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        mask = cv2.resize(
-            mask,
-            (self._image_width, self._image_height),
-            interpolation=cv2.INTER_NEAREST,
-        )
+            # Resize to model input dimensions
+            image = cv2.resize(
+                image,
+                (self._image_width, self._image_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            mask = cv2.resize(
+                mask,
+                (self._image_width, self._image_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        except Exception as exc:
+            logger.warning("Skipping sample %s: %s", sample["line_id"], exc)
+            # Return blank sample
+            image = np.ones(
+                (self._image_height, self._image_width), dtype=np.uint8
+            ) * 255
+            mask = np.zeros(
+                (self._image_height, self._image_width), dtype=np.uint8
+            )
 
         # Clamp mask values
         mask = np.clip(mask, 0, NUM_CLASSES - 1)
@@ -472,9 +445,9 @@ class IAMDataset(Dataset):
         # Convert to tensors
         image_tensor = torch.from_numpy(
             image.astype(np.float32) / 255.0
-        ).unsqueeze(0)  # (1, H, W)
+        ).unsqueeze(0)
 
-        mask_tensor = torch.from_numpy(mask.astype(np.int64))  # (H, W)
+        mask_tensor = torch.from_numpy(mask.astype(np.int64))
 
         return {
             "image": image_tensor,
@@ -496,7 +469,6 @@ class IAMDataset(Dataset):
 def create_iam_dataloader(
     iam_root: str,
     split: str = "test",
-    mode: str = "lines",
     batch_size: int = 4,
     num_workers: int = 4,
     image_height: int = 512,
@@ -504,16 +476,13 @@ def create_iam_dataloader(
     binarization_threshold: Optional[int] = None,
     min_component_area: int = 10,
     max_samples: Optional[int] = None,
+    **kwargs,
 ) -> Tuple[DataLoader, IAMDataset]:
     """Create a DataLoader for IAM evaluation.
-
-    Returns both the DataLoader and the Dataset for access to
-    metadata (transcriptions, line IDs).
 
     Args:
         iam_root: Root directory of the IAM database.
         split: Which split to use.
-        mode: 'lines' or 'words'.
         batch_size: Batch size.
         num_workers: Number of data loading workers.
         image_height: Target image height.
@@ -528,7 +497,6 @@ def create_iam_dataloader(
     dataset = IAMDataset(
         iam_root=iam_root,
         split=split,
-        mode=mode,
         image_height=image_height,
         image_width=image_width,
         binarization_threshold=binarization_threshold,
@@ -536,7 +504,6 @@ def create_iam_dataloader(
         max_samples=max_samples,
     )
 
-    # Custom collate to handle string fields
     def collate_fn(batch):
         images = torch.stack([s["image"] for s in batch])
         masks = torch.stack([s["mask"] for s in batch])
@@ -563,14 +530,7 @@ def create_iam_dataloader(
 
 
 def create_iam_adapter_from_config(cfg) -> Tuple[DataLoader, IAMDataset]:
-    """Factory function to create IAM DataLoader from OmegaConf config.
-
-    Args:
-        cfg: OmegaConf configuration object (the full config).
-
-    Returns:
-        Tuple of (DataLoader, IAMDataset).
-    """
+    """Factory function to create IAM DataLoader from OmegaConf config."""
     return create_iam_dataloader(
         iam_root=cfg.data.paths.iam_root,
         split=cfg.evaluation.iam.split,
@@ -578,6 +538,6 @@ def create_iam_adapter_from_config(cfg) -> Tuple[DataLoader, IAMDataset]:
         num_workers=cfg.data.loader.num_workers,
         image_height=cfg.data.synthetic.image_height,
         image_width=cfg.data.synthetic.image_width,
-        binarization_threshold=cfg.evaluation.iam.binarization_threshold,
+        binarization_threshold=None,
         min_component_area=cfg.evaluation.iam.min_component_area,
     )
