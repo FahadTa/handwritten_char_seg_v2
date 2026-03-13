@@ -8,7 +8,7 @@ Pixel-level semantic segmentation of handwritten characters using deep learning,
 
 ## Overview
 
-This project extends the [v1 handwritten character segmentation system](https://github.com/FahadTa/handwritten_char_seg_v2) with three key improvements:
+This project extends the [v1 handwritten character segmentation system](https://github.com/FahadTa/Handwritten_Character_Segmentation) with three key improvements:
 
 1. **Pixel-level masks via binarization + AND** — Masks follow actual glyph shapes instead of rectangular bounding boxes
 2. **Slant augmentation and extended augmentations** — Render-time cursive simulation plus affine, elastic, morphological, and photometric transforms
