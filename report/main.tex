@@ -1,0 +1,1487 @@
+% =============================================================================
+% Handwritten Character Segmentation v2 --- Project Report
+% Author:      Fahad Tariq (Matriculation: 23186464)
+% Supervisor:  Dr.-Ing. Vincent Christlein
+% Institution: Pattern Recognition Lab, FAU Erlangen-Nürnberg
+% =============================================================================
+
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[british]{babel}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage[margin=2.5cm, headheight=14pt]{geometry}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[
+    colorlinks=true,
+    linkcolor=blue!65!black,
+    citecolor=blue!65!black,
+    urlcolor=blue!65!black,
+    pdftitle={Handwritten Character Segmentation v2},
+    pdfauthor={Fahad Tariq},
+]{hyperref}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\small Handwritten Character Segmentation v2}
+\lhead{\small Fahad Tariq --- FAU Erlangen-Nürnberg}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\eg}{\emph{e.g.},\xspace}
+\newcommand{\ie}{\emph{i.e.},\xspace}
+
+% =============================================================================
+\begin{document}
+% =============================================================================
+
+% -----------------------------------------------------------------------------
+% Title Page
+% -----------------------------------------------------------------------------
+\begin{titlepage}
+    \centering
+    \vspace*{0.5cm}
+    \includegraphics[width=0.55\textwidth]{fau_logo.png}
+
+    \vfill
+
+    {\LARGE\bfseries Handwritten Character Segmentation\par}
+    \vspace{0.5cm}
+    {\large Extended to Real Handwriting with Pixel-Level Masks\par}
+    \vspace{1.5cm}
+    {\large Project Report\par}
+
+    \vfill
+
+    \begin{tabular}{@{}ll@{}}
+        Handed in by:         & Fahad Tariq                 \\[6pt]
+        Matriculation number: & 23186464                    \\[6pt]
+        Supervisor:           & Dr.-Ing. Vincent Christlein \\
+    \end{tabular}
+
+    \vspace*{\fill}
+    {\small Pattern Recognition Lab
+        \enspace---\enspace
+        Martensstra\ss{}e~3
+        \enspace---\enspace
+        91058~Erlangen
+        \enspace---\enspace
+        lme.tf.fau.de\par}
+    \vspace{0.5cm}
+\end{titlepage}
+
+% -----------------------------------------------------------------------------
+% Abstract
+% -----------------------------------------------------------------------------
+\begin{abstract}
+\noindent
+This report presents the second iteration of a deep learning pipeline for handwritten
+character segmentation, developed in direct response to supervisor feedback on the first
+version. Three concrete improvements were made: segmentation masks are now generated at
+the pixel level via a binarisation-and-AND procedure rather than filled bounding boxes,
+ensuring that the model is trained to predict actual glyph contours rather than
+rectangular regions; a render-time slant transform combined with an extended suite of
+affine, elastic, morphological, and photometric augmentations is applied to better
+simulate cursive and naturalistic handwriting variability; and trained models are
+evaluated on real handwriting data from the IAM Handwriting Database for the first time,
+providing a quantitative assessment of synthetic-to-real generalisation. Two architectures
+are compared side by side---an Attention U-Net (29.3M parameters) and a SwinUNet based
+on the Swin Transformer (41.4M parameters)---both trained on 15,000 synthetic images
+spanning 80 character classes. On the synthetic test set, the Attention U-Net achieves a
+best validation IoU of 98.08\% and a class-balanced macro IoU of 61.20\%, while SwinUNet
+reaches 95.10\% validation IoU but a higher macro IoU of 68.20\%, indicating that
+transformer-based global self-attention provides better per-class discrimination across a
+long-tailed 80-class vocabulary. Evaluation on 1,861 real handwriting lines from the IAM
+test split reveals a substantial and clearly two-tiered synthetic-to-real domain gap:
+pixel-level accuracy degrades moderately to 84--87\%, confirming that low-level
+ink-detection features partially transfer, whereas character-level macro IoU collapses to
+below 0.3\% for both architectures, confirming that higher-level character-identity
+features are tightly coupled to the font-rendered appearance of the synthetic domain and
+do not generalise to natural handwriting. This dissociation precisely isolates the
+remaining challenge for this task and motivates future work in domain adaptation, targeted
+fine-tuning on real annotations, and stroke-level synthetic data generation.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+\listoffigures
+\listoftables
+\newpage
+
+% =============================================================================
+\section{Introduction}
+\label{sec:introduction}
+% =============================================================================
+
+\subsection{Background}
+
+Segmenting individual characters in handwritten text is one of the harder sub-problems
+in document image analysis. It sits directly upstream of recognition, so errors here
+propagate through any downstream OCR or text extraction system. What makes it genuinely
+difficult is that handwriting is inherently personal: stroke width, slant, character
+spacing, and ligature formation vary not just across writers but within a single line from
+the same writer. Unlike printed text, there are no clean white gaps between characters to
+exploit, and the boundaries between adjacent letters are often ambiguous even to a human
+reader at the pixel level.
+
+Deep learning, and convolutional semantic segmentation in particular, has changed the
+landscape considerably. Architectures like U-Net~\cite{ronneberger2015} and its
+attention-gated variant~\cite{oktay2018} learn to produce dense per-pixel class
+predictions directly from data, bypassing the need for hand-engineered feature pipelines.
+More recently, vision transformers have demonstrated that global self-attention can
+capture long-range dependencies missed by purely local convolutional
+operations~\cite{liu2021,cao2022}, making them worth evaluating on a task like character
+segmentation where context across a word or line is meaningful.
+
+\subsection{Summary of Version 1}
+
+The first version of this project established a working baseline. It rendered
+handwritten-style fonts on blank canvases, generated segmentation masks via template
+matching, and trained a single Attention U-Net that achieved 91.31\% pixel-weighted IoU
+on a synthetic test set. During supervisor review, three shortcomings were identified:
+
+\begin{enumerate}[leftmargin=*, label=(\arabic*)]
+    \item The segmentation masks were filled rectangular bounding boxes rather than
+          pixel-accurate character contours. This meant the model was trained to predict
+          boxes, not glyph shapes---a fundamental mismatch between the training objective
+          and the desired output.
+    \item No slant or cursive augmentation was applied, limiting the variety of writing
+          styles seen during training and reducing robustness to real handwriting slant.
+    \item Evaluation never left the synthetic domain. There was no assessment on real
+          handwriting, so it was entirely unknown whether the model generalised at all to
+          natural writing.
+\end{enumerate}
+
+\subsection{Objectives of Version 2}
+
+This report addresses all three points directly, following explicit guidance from
+Dr.-Ing.\ Vincent Christlein:
+
+\begin{enumerate}[leftmargin=*, label=(\arabic*)]
+    \item \textbf{Pixel-level masks.} Replace bounding-box fills with glyph-contour masks
+          generated by rendering each character in isolation, binarising the result, and
+          taking the pixel-wise AND with the character region. The resulting masks follow
+          actual ink shapes, including thin strokes, curves, and descenders.
+    \item \textbf{Augmentation pipeline.} Introduce render-time horizontal shear to
+          simulate cursive slant, and add a comprehensive training-time augmentation
+          pipeline covering affine transforms, elastic deformation, morphological erosion
+          and dilation (simulating pen pressure variation), photometric changes, and
+          Gaussian noise (simulating scanning and paper texture artefacts).
+    \item \textbf{Real data evaluation.} Evaluate trained models on the IAM Handwriting
+          Database~\cite{marti2002} and produce a quantitative domain gap analysis that
+          compares synthetic and real performance side by side.
+\end{enumerate}
+
+As an additional contribution beyond the three requested improvements, two architectures
+are trained and compared---Attention U-Net and SwinUNet---to assess whether
+transformer-based global context modelling offers advantages over the convolutional
+approach for this task.
+
+\subsection{Contributions}
+
+The main contributions of this work are:
+
+\begin{enumerate}[leftmargin=*, label=(\arabic*)]
+    \item A pixel-accurate mask generation pipeline producing true glyph-contour
+          annotations via binarisation and pixel-wise AND operations, correcting the
+          fundamental training objective mismatch in version~1.
+    \item A render-time slant augmentation scheme and an extended training-time pipeline
+          combining geometric, morphological, photometric, and noise transforms, each
+          motivated by a specific property of real handwriting variability.
+    \item A controlled comparison between Attention U-Net and SwinUNet architectures on
+          the same 80-class segmentation task, revealing a meaningful trade-off between
+          pixel-level boundary precision and class-level discrimination.
+    \item The first quantitative domain gap analysis for this system, evaluated on 1,861
+          real handwriting images from the IAM test split, with a two-tiered
+          characterisation separating low-level feature transfer from high-level class
+          generalisation failure.
+    \item A modular, reproducible codebase with full experiment tracking via
+          Weights~\&~Biases~\cite{wandb2020}, centralised YAML configuration, and separate
+          evaluation scripts for synthetic and real data.
+\end{enumerate}
+
+\subsection{Report Structure}
+
+Section~\ref{sec:methodology} covers the full methodology: dataset generation, the pixel
+mask procedure, the augmentation pipeline, both model architectures, training
+configuration, and the IAM evaluation protocol. Section~\ref{sec:results} presents
+quantitative and qualitative results on both synthetic and real data.
+Section~\ref{sec:discussion} discusses what the results mean, where the current approach
+falls short, and what future directions are most promising.
+Section~\ref{sec:conclusion} summarises the work.
+
+% =============================================================================
+\section{Methodology}
+\label{sec:methodology}
+% =============================================================================
+
+\subsection{Synthetic Dataset Generation}
+
+\subsubsection{Text Sampling and Canvas Rendering}
+
+Text content is sampled from Wikipedia articles using the \texttt{wikipedia-api} library,
+which provides broad linguistic diversity across topics, vocabulary, and punctuation
+patterns. Each image is produced by rendering 3--7 lines of text onto a $512 \times 512$
+pixel white canvas (intensity 255). A font is selected at random for each image from a
+curated collection of handwritten-style TrueType fonts sourced from Google Fonts, at a
+randomly chosen size between 28 and 48 pixels. Text intensity is sampled uniformly
+between 0 and 60 on a grey scale, introducing ink darkness variation that simulates
+differences in pen ink density and paper contrast. The complete synthetic dataset contains
+15,000 images partitioned into 12,000 training, 1,500 validation, and 1,500 test images.
+
+\subsubsection{Pixel-Level Mask Generation}
+\label{sec:pixel_masks}
+
+The central correction from version~1 is the mask generation procedure. Previously, each
+character was assigned a filled rectangular bounding box in the mask, which told the
+model to predict boxes rather than character shapes. This is a fundamental training
+objective mismatch: the model optimises its predictions to match rectangular fills, but
+the desired output for a useful segmentation system is a mask that follows the actual ink
+contour of each character.
+
+The new approach generates a true glyph-contour mask for every character:
+
+\begin{enumerate}[leftmargin=*, label=\arabic*.]
+    \item Render the character in isolation on a blank white canvas at its computed layout
+          position, using the same font, size, and colour as in the composite image.
+    \item Binarise the rendered glyph with a fixed threshold of 128, producing a binary
+          mask where ink pixels are 1 and background pixels are 0.
+    \item Write the character's class index into the segmentation mask \emph{only at
+          foreground (ink) pixel locations}---the pixel-wise AND of the bounding region
+          with the binarised glyph.
+\end{enumerate}
+
+This procedure means thin strokes produce thin masks, curves produce curved masks, and
+descenders extend below the baseline exactly as they appear in the rendered image. The
+result is a ground-truth mask that is spatially co-registered with the visual ink, making
+the segmentation task well-defined at the pixel level. When two characters overlap (rare
+in practice with the chosen font sizes and spacing), the later character's class index
+overwrites the earlier one at shared pixels, which mirrors the visual rendering order.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/dataset_samples.png}
+    \caption{Representative samples from the synthetic training dataset. Each row shows
+    the rendered input image (left), the pixel-level ground-truth segmentation mask
+    (centre), and a colour overlay blending both (right). Each colour in the mask
+    corresponds to a distinct character class. The masks follow actual glyph contours
+    rather than rectangular bounding boxes, meaning thin strokes, curves, descenders,
+    and inter-character spacing are all labelled at the pixel level. Note the diversity
+    of handwriting styles across rows, introduced by using multiple handwritten-style
+    fonts at varying sizes and slant angles.}
+    \label{fig:dataset_samples}
+\end{figure}
+
+\subsubsection{Character Vocabulary}
+
+The vocabulary spans 80 classes in total: one background class (index 0) plus 79
+character classes. These comprise 26 uppercase letters (A--Z), 26 lowercase letters
+(a--z), 10 digits (0--9), and 17 special characters including space, period, comma,
+semicolon, colon, exclamation mark, question mark, apostrophe, hyphen, quotation marks,
+parentheses, ampersand, slash, at sign, hash, and plus sign. The mapping is defined in a
+single \texttt{charset.py} module imported by all other pipeline components, ensuring
+there is one authoritative source for class indices throughout the codebase.
+
+\subsection{Augmentation Pipeline}
+
+Augmentation operates at two distinct stages: render time (applied while generating the
+synthetic dataset) and training time (applied on-the-fly in the data loader). Keeping
+them separate makes the generated dataset fully reproducible while still providing
+stochastic diversity during training. Critically, every augmentation in this pipeline is
+motivated by a specific property of real handwriting that is absent from clean
+font-rendered images.
+
+\subsubsection{Render-Time Slant Augmentation}
+
+To simulate the forward or backward lean characteristic of cursive handwriting, a
+horizontal shear transform is applied at render time with probability 0.5. The shear
+factor $s$ is sampled uniformly from $[-0.4,\, 0.4]$, covering a wide range of slant
+angles from strongly backward-leaning to strongly forward-leaning text. The shear
+matrix, centred vertically at height $h$, is:
+
+\begin{equation}
+    \begin{bmatrix} x' \\ y' \end{bmatrix}
+    =
+    \begin{bmatrix} 1 & s \\ 0 & 1 \end{bmatrix}
+    \begin{bmatrix} x \\ y \end{bmatrix}
+    +
+    \begin{bmatrix} -sh/2 \\ 0 \end{bmatrix}
+    \label{eq:shear}
+\end{equation}
+
+Critically, the \emph{same} shear matrix is applied to both the rendered image (using
+bilinear interpolation) and the segmentation mask (using nearest-neighbour interpolation
+to preserve integer class indices). This is essential for mask consistency: applying
+shear to the image without applying the same transform to the mask would produce
+misaligned supervision signal and corrupt the training objective.
+
+\subsubsection{Training-Time Augmentations}
+
+Additional augmentations are applied stochastically during data loading via the
+Albumentations library~\cite{albumentations2020}, combined with two custom transforms
+for morphological operations. The pipeline is organised into four groups. The rationale
+for each group is stated alongside the parameters, connecting each augmentation to the
+specific real handwriting property it targets.
+
+\medskip
+\noindent\textbf{Geometric transforms} (applied jointly to image and mask, probability
+0.5):
+\begin{itemize}[noitemsep]
+    \item Affine: rotation ($\pm 3^{\circ}$), shear ($\pm 5^{\circ}$), scale (0.95--1.05), translation
+          ($\pm 3\%$). \emph{Rationale:} real writers do not place text on a perfectly
+          horizontal baseline; small global misalignments are ubiquitous in scanned
+          documents.
+    \item Perspective distortion (scale 0.02--0.05). \emph{Rationale:} documents are
+          rarely scanned flat; perspective foreshortening introduces systematic spatial
+          distortion.
+    \item Elastic deformation ($\alpha = 30$, $\sigma = 5$). \emph{Rationale:} the
+          waviness and local curvature of hand-drawn strokes arise from natural motor
+          tremor and pen velocity variation that font rendering cannot replicate.
+\end{itemize}
+
+\medskip
+\noindent\textbf{Morphological transforms} (image only, probability 0.3):
+\begin{itemize}[noitemsep]
+    \item Erosion (kernel up to $2 \times 2$): thins ink strokes. \emph{Rationale:} light
+          pen pressure or fast writing produces thin, faint strokes that erode the
+          character body.
+    \item Dilation (kernel up to $2 \times 2$): thickens ink strokes. \emph{Rationale:}
+          heavy pen pressure or slow writing produces broad, dense strokes that expand the
+          character body.
+    \item Simulated ink variation: localised brightness perturbation on foreground pixels
+          only. \emph{Rationale:} ink flow in a real pen is not constant; starved or
+          flooded regions produce within-stroke intensity gradients absent from rendered
+          text.
+\end{itemize}
+
+\noindent Morphological transforms are applied only to the image, not the mask, because
+they alter the visual appearance of ink strokes without changing the semantic identity of
+the character being written.
+
+\medskip
+\noindent\textbf{Photometric transforms} (image only, probability 0.5):
+\begin{itemize}[noitemsep]
+    \item Random brightness and contrast ($\pm 15\%$). \emph{Rationale:} paper yellowing,
+          scanner calibration differences, and ambient lighting all affect document image
+          contrast.
+    \item CLAHE (clip limit 2.0). \emph{Rationale:} local histogram equalisation simulates
+          the contrast normalisation often applied during document pre-processing, exposing
+          the model to inputs that may arrive pre-processed at inference time.
+\end{itemize}
+
+\medskip
+\noindent\textbf{Noise transforms} (image only, probability 0.3):
+\begin{itemize}[noitemsep]
+    \item Gaussian noise (variance up to 15.0). \emph{Rationale:} CCD sensor noise in
+          scanner hardware introduces additive Gaussian noise, particularly in lightly
+          illuminated regions.
+    \item Gaussian blur (kernel size up to $3 \times 3$). \emph{Rationale:} out-of-focus
+          scanning and ink bleed into paper fibres both produce low-pass blurring of stroke
+          edges.
+\end{itemize}
+
+\medskip
+\noindent Geometric transforms must be applied to both image and mask simultaneously to
+preserve label alignment. All other transforms affect only pixel intensities and are
+therefore applied to the image alone.
+
+\subsection{Model Architectures}
+
+\subsubsection{Attention U-Net}
+
+The Attention U-Net~\cite{oktay2018} follows a standard encoder-decoder structure with
+skip connections between corresponding encoder and decoder levels, enhanced with attention
+gates. The encoder consists of four blocks with channel dimensions
+$[64, 128, 256, 512]$, each containing two $3 \times 3$ convolutions with batch
+normalisation and ReLU activation, followed by $2 \times 2$ max pooling for
+downsampling. A bottleneck block operates at 1,024 channels.
+
+The decoder comprises four symmetric upsampling blocks. Bilinear upsampling followed by
+a $1 \times 1$ projection is used in preference to transposed convolution, which is prone
+to checkerboard artefacts. Each decoder block applies an attention gate to the incoming
+skip connection before concatenation. The gate computes attention coefficients from both
+the decoder (gating) signal $\mathbf{g}$ and the encoder skip signal $\mathbf{x}^l$:
+
+\begin{equation}
+    \alpha^l = \sigma_2\!\left( \mathbf{W}_\psi \cdot \sigma_1\!\left(
+    \mathbf{W}_x \mathbf{x}^l + \mathbf{W}_g \mathbf{g} + b_g \right)
+    + b_\psi \right)
+    \label{eq:attention_gate}
+\end{equation}
+
+where $\sigma_1$ is ReLU, $\sigma_2$ is sigmoid, and $\mathbf{W}_x$, $\mathbf{W}_g$,
+$\mathbf{W}_\psi$ are learned linear projections. The resulting attention map
+$\alpha^l \in [0,1]$ is applied element-wise to $\mathbf{x}^l$, suppressing background
+regions and amplifying character boundary features before the skip connection reaches the
+decoder. Dropout ($p = 0.1$) is applied after each decoder block. The output is a
+$1 \times 1$ convolution producing 80 channel logits. Total trainable parameters:
+\textbf{29.3M}.
+
+\subsubsection{SwinUNet}
+
+The SwinUNet~\cite{cao2022} replaces convolutional blocks throughout the encoder and
+decoder with Swin Transformer blocks~\cite{liu2021}, making it a pure-transformer
+segmentation architecture. Input images are first partitioned into non-overlapping
+$4 \times 4$ patches and projected to an embedding dimension of 96. Four encoder stages
+process these tokens with depths $[2, 2, 6, 2]$ and attention head counts
+$[3, 6, 12, 24]$.
+
+Within each stage, Swin Transformer blocks alternate between standard window attention
+and shifted-window attention. Regular window attention restricts self-attention to
+non-overlapping $8 \times 8$ windows, reducing quadratic complexity from
+$\mathcal{O}(n^2)$ to $\mathcal{O}(n \cdot w^2)$ where $w$ is the window size.
+Shifted-window attention in alternating blocks displaces window boundaries by half a
+window size, enabling cross-window information exchange without global attention.
+Learnable relative position biases provide spatial awareness within each window.
+
+Patch merging between encoder stages halves the spatial resolution and doubles the
+channel dimension, analogous to max pooling in a CNN. The decoder mirrors this with patch
+expanding layers for upsampling and linear projections for skip connection fusion.
+Stochastic depth regularisation applies a linearly increasing drop probability from 0 to
+0.1 across layers. The final projection maps to 80 output classes. Total trainable
+parameters: \textbf{41.4M}.
+
+The key architectural distinction relevant to this task is that global self-attention
+across the full sequence of patch tokens is gradually accumulated through the
+shifted-window mechanism, allowing the model to relate spatially distant characters within
+a line. This is qualitatively different from the local receptive field growth of a CNN
+encoder, and may contribute to better discrimination between visually similar character
+classes when their surrounding context is informative.
+
+\subsection{Training Procedure}
+
+\subsubsection{Loss Function}
+
+Training minimises a combined loss~\cite{sudre2017}:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = 0.5 \cdot \mathcal{L}_{\text{Dice}}
+    + 0.5 \cdot \mathcal{L}_{\text{CE}}
+    \label{eq:loss}
+\end{equation}
+
+The Dice component is computed per class and averaged \emph{only over classes present in
+the current batch}, avoiding the degenerate case where absent classes contribute a
+near-zero-prediction Dice score of approximately 1.0 that would dominate the gradient
+with an uninformative signal:
+
+\begin{equation}
+    \mathcal{L}_{\text{Dice}} = 1 - \frac{1}{|C_{\text{present}}|}
+    \sum_{c \in C_{\text{present}}}
+    \frac{2\displaystyle\sum_i p_{i,c}\, g_{i,c} + \epsilon}
+         {\displaystyle\sum_i p_{i,c} + \sum_i g_{i,c} + \epsilon}
+    \label{eq:dice}
+\end{equation}
+
+where $C_{\text{present}}$ is the set of classes with at least one ground-truth pixel in
+the batch, $p_{i,c}$ and $g_{i,c}$ are the predicted probability and one-hot ground
+truth for pixel $i$ and class $c$, and $\epsilon = 1.0$ is a smoothing constant.
+
+The Cross-Entropy component uses per-class weights to address the large class-frequency
+imbalance across 80 classes. Weights are computed as inverse class frequency, then
+dampened by a square-root transform to avoid extreme values for very rare classes, and
+clamped to a maximum of 10.0. The background class weight is further reduced by 95\% so
+that the abundant background pixels do not dominate the gradient. Label smoothing of 0.01
+prevents overconfident predictions.
+
+The combination is motivated by complementary strengths: Cross-Entropy provides stable,
+well-behaved gradients throughout training and handles multi-class classification
+naturally; Dice loss directly optimises the overlap metric that is reported at evaluation
+time and is inherently robust to class imbalance by normalising over predicted and
+ground-truth areas.
+
+\subsubsection{Optimisation and Training Configuration}
+
+All models are trained with the AdamW optimiser~\cite{loshchilov2019} at a learning rate
+of $3 \times 10^{-4}$ and weight decay $1 \times 10^{-4}$. Cosine annealing reduces the
+learning rate to a minimum of $1 \times 10^{-6}$ over 100 epochs. Gradient norms are
+clipped to 1.0. Training uses 16-bit mixed precision and PyTorch DDP across 4 NVIDIA GPUs
+with per-GPU batch size 4 and gradient accumulation over 4 steps, giving an effective
+batch size of 64. Early stopping monitors validation IoU with patience of 25 epochs.
+Training is managed by PyTorch Lightning~\cite{falcon2019}. Table~\ref{tab:training_config}
+summarises the key hyperparameters.
+
+\begin{table}[H]
+\centering
+\caption{Training Configuration}
+\label{tab:training_config}
+\begin{tabular}{ll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Optimiser            & AdamW \\
+Learning rate        & $3 \times 10^{-4}$ \\
+Weight decay         & $1 \times 10^{-4}$ \\
+LR schedule          & Cosine annealing ($\eta_{\min} = 10^{-6}$, $T_{\max} = 100$) \\
+Effective batch size & 64 (4/GPU $\times$ 4 GPUs $\times$ 4 accum.) \\
+Loss                 & Dice + CE (0.5 each), present-class averaging \\
+Label smoothing      & 0.01 \\
+Gradient clipping    & max norm 1.0 \\
+Precision            & 16-bit mixed \\
+Early stopping       & patience 25, monitor val/IoU (macro, pixel-weighted) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{IAM Evaluation Protocol}
+
+\subsubsection{Dataset}
+
+The IAM Handwriting Database~\cite{marti2002} contains English text handwritten by 657
+writers on pre-printed forms. We evaluate on 1,861 line images from the standard Large
+Writer Independent Text Line Recognition Task test split. IAM provides word-level
+bounding box annotations and character-level transcriptions, but does not provide
+pixel-level segmentation masks. To enable quantitative evaluation without manual
+annotation, pseudo ground-truth masks are generated automatically.
+
+\subsubsection{Pseudo Mask Generation}
+\label{sec:pseudo_masks}
+
+Since pixel-level character segmentation annotations are unavailable in IAM, approximate
+masks are constructed as follows:
+
+\begin{enumerate}[leftmargin=*, label=\arabic*.]
+    \item Apply Otsu's automatic thresholding to binarise the handwriting image, adapting
+          to each image's local contrast.
+    \item Extract connected components with 8-connectivity and discard any with fewer than
+          10 pixels (noise suppression).
+    \item Group components into text lines by vertical centroid proximity.
+    \item Within each line, sort components left-to-right by horizontal centroid.
+    \item Assign components to transcription characters sequentially, mapping each
+          component's pixels to the class index of the corresponding character.
+\end{enumerate}
+
+\noindent\textbf{Edge case handling.} When the number of extracted components does not
+match the number of transcription characters, the following rules apply: if there are
+\emph{fewer} components than characters (most commonly due to touching characters merging
+into a single connected region), the available components are assigned to the first $k$
+transcription characters and remaining characters receive no mask pixels. If there are
+\emph{more} components than characters (most commonly due to dotted or multi-stroke
+letters such as `i', `j', or `t' producing multiple disconnected regions), excess
+components beyond the transcription length are discarded and assigned to background.
+
+This procedure is necessarily approximate. Touching characters, split characters, and
+reading-order ambiguities all introduce systematic noise into the resulting masks.
+Real cursive handwriting is particularly problematic: characters frequently connect
+into a single continuous pen stroke, causing multiple characters to merge into one
+connected component that is then incorrectly attributed to only the first transcription
+character in the group. Consequently, IAM metrics \emph{underestimate} true model
+performance to some degree and should be interpreted as a relative lower bound for domain
+gap assessment rather than an absolute accuracy figure. The primary purpose of the IAM
+evaluation is to establish that a domain gap exists and to quantify its structural
+character, not to report production-quality accuracy on real handwriting.
+
+\subsection{Evaluation Metrics}
+\label{sec:metrics}
+
+All metrics exclude the background class (index 0) from macro averaging. Three levels of
+granularity are reported:
+
+\medskip
+\noindent\textbf{Overall metrics} (macro-averaged over active foreground classes):
+\begin{align}
+    \text{IoU}_c &= \frac{|\hat{P}_c \cap G_c|}{|\hat{P}_c \cup G_c|}, \qquad
+    \overline{\text{IoU}} = \frac{1}{|C_{\text{active}}|}
+    \sum_{c \in C_{\text{active}}} \text{IoU}_c
+    \label{eq:iou} \\[6pt]
+    \text{Dice}_c &= \frac{2|\hat{P}_c \cap G_c|}{|\hat{P}_c| + |G_c|}, \qquad
+    \text{Pixel Acc} = \frac{\sum_c \text{TP}_c}{\text{total pixels}}
+    \label{eq:dice_eval}
+\end{align}
+
+\noindent\textbf{Per-group metrics}: Aggregated separately for uppercase, lowercase,
+digits, and special characters.
+
+\noindent\textbf{Per-class metrics}: Individual IoU, Dice, precision, recall, and F1 for
+each of the 79 foreground classes, enabling fine-grained analysis of which characters are
+hardest to segment.
+
+\medskip
+\noindent\textbf{Important note on metric computation.} Two distinct IoU computations
+appear in this report and must not be conflated. During training, validation IoU is
+computed online by \texttt{torchmetrics} \texttt{MulticlassJaccardIndex} with
+\texttt{average="macro"}, which averages per-class IoU values weighted by the number of
+pixels per class---this gives larger, more frequent classes greater influence and drives
+the early stopping criterion. At evaluation time, the full confusion matrix is accumulated
+over the entire test set and macro IoU is computed by giving every foreground class
+\emph{equal weight} regardless of pixel frequency---a class-balanced average that
+penalises underperformance on rare characters equally with common ones.
+
+These two quantities are not directly comparable, and a model may rank differently on
+each. In particular, a model can achieve high pixel-weighted validation IoU by excelling
+on high-frequency classes while failing on rare ones, yet score substantially lower on the
+class-balanced test macro IoU. The class-balanced macro IoU is the primary evaluation
+metric reported in all result tables throughout this report, as it provides a more
+demanding and informative measure of segmentation quality across the full 80-class
+vocabulary.
+
+A direct consequence for model selection is that early stopping based on pixel-weighted
+validation IoU does not guarantee selection of the checkpoint that maximises
+class-balanced test IoU. This metric inconsistency is discussed further in
+Section~\ref{sec:metric_inconsistency}.
+
+\subsection{Implementation Details}
+
+The system is implemented in Python 3.11 with PyTorch 2.1~\cite{paszke2019} (CUDA 11.8).
+PyTorch Lightning~2.1.4~\cite{falcon2019} manages the training loop, distributed
+training, and checkpointing. Experiment tracking and hyperparameter visualisation use
+Weights~\&~Biases~\cite{wandb2020}. Augmentations are implemented with
+Albumentations~1.4.4~\cite{albumentations2020}, extended with two custom
+\texttt{ImageOnlyTransform} classes for morphological erosion and dilation. Configuration
+is centralised in a single YAML file parsed by OmegaConf, making every experimental
+setting reproducible from one file. All experiments use random seed 42 for
+reproducibility.
+
+% =============================================================================
+\section{Results}
+\label{sec:results}
+% =============================================================================
+
+\subsection{Training Dynamics}
+
+\subsubsection{Attention U-Net}
+
+Training ran for 82 epochs before early stopping triggered, with the best checkpoint
+identified at epoch~67 (validation IoU 98.08\%, extracted from the saved
+\texttt{.ckpt} file). Learning was rapid in the early phase: validation IoU climbed from
+18.4\% at epoch~0 to 64.0\% by epoch~6 and crossed 93\% by epoch~28, indicating that
+the attention mechanism and pixel-level masks together provided a clean, strong training
+signal from the outset. Each epoch completed in approximately 3~minutes 14~seconds
+across the four GPUs.
+
+\subsubsection{SwinUNet}
+
+SwinUNet converged more slowly in the first few epochs---starting from 0.5\% validation
+IoU at epoch~0 compared to 18.4\% for the Attention U-Net. This slow start is consistent
+with transformer architectures requiring more gradient updates to initialise meaningful
+attention patterns from random weights. After this warm-up phase, SwinUNet converged
+steadily, with the best checkpoint identified at epoch~61 (validation IoU 95.10\%,
+extracted from the saved \texttt{.ckpt} file). Early stopping halted training at
+epoch~86. Despite having 41\% more parameters, each epoch completed in approximately
+3~minutes, marginally faster than the Attention U-Net, reflecting the more parallelisable
+nature of transformer matrix operations on GPU hardware.
+
+\subsubsection{Training Summary}
+
+Table~\ref{tab:training_summary} provides a compact summary of the training run for both
+architectures for direct comparison.
+
+\begin{table}[H]
+\centering
+\caption{Training Run Summary}
+\label{tab:training_summary}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Architecture} & \textbf{Best Epoch} & \textbf{Best Val IoU} & \textbf{Best Val Dice}
+    & \textbf{Total Epochs} & \textbf{Time / Epoch} \\
+\midrule
+Attention U-Net & 67 & 98.08\% & 96.10\% & 82 & $\approx$3 min 14 s \\
+SwinUNet        & 61 & 95.10\% & 92.81\% & 86 & $\approx$3 min 00 s \\
+\bottomrule
+\multicolumn{6}{l}{\footnotesize Best-epoch values are extracted from saved \texttt{.ckpt}
+files; see Figure~\ref{fig:training_curves} for details.} \\
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_training_curves.png}
+        \caption{Attention U-Net: validation IoU (left) and validation Dice (right) over
+        training epochs.}
+        \label{fig:unet_training_curves}
+    \end{subfigure}
+
+    \vspace{1em}
+
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_training_curves.png}
+        \caption{SwinUNet: validation IoU (left) and validation Dice (right) over training
+        epochs.}
+        \label{fig:swin_training_curves}
+    \end{subfigure}
+
+    \caption{Training dynamics for both architectures. Validation IoU and validation Dice
+    are plotted over the epochs recorded by the W\&B logger. The grey shaded region in
+    each plot (approximately epochs 0--45) corresponds to early training during which the
+    W\&B run was interrupted by an HPC job preemption; these epochs completed successfully
+    and their model checkpoints were saved locally, but metrics were not synced to the
+    W\&B server. The \textbf{Best} annotations visible within each subplot indicate the
+    peak values observed within the logged portion of training only (post-epoch~45)---they
+    are \emph{not} the global best values across the full run. The authoritative
+    best-checkpoint values---\textbf{98.08\%} validation IoU at epoch~67 for the Attention
+    U-Net and \textbf{95.10\%} at epoch~61 for SwinUNet---were identified from the saved
+    \texttt{.ckpt} files by reading the \texttt{best\_model\_score} field recorded by the
+    \texttt{ModelCheckpoint} callback at the time of saving, independently of W\&B. All
+    result tables in this report use these checkpoint-derived values; see
+    Table~\ref{tab:training_summary}.}
+    \label{fig:training_curves}
+\end{figure}
+
+\subsection{Synthetic Test Set Evaluation}
+
+\subsubsection{Overall Metrics}
+
+Table~\ref{tab:synthetic_results} reports the full evaluation on the held-out synthetic
+test set of 1,500 images. Bold entries indicate the better score for each metric.
+
+\begin{table}[H]
+\centering
+\caption{Synthetic Test Set Performance Comparison}
+\label{tab:synthetic_results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Attention U-Net} & \textbf{SwinUNet} \\
+\midrule
+Best Validation IoU (pixel-weighted)$^\dagger$ & \textbf{98.08\%} & 95.10\% \\
+Pixel Accuracy                                 & 98.59\%          & \textbf{99.03\%} \\
+Macro IoU (class-balanced)                     & 61.20\%          & \textbf{68.20\%} \\
+Macro Dice (class-balanced)                    & 75.07\%          & \textbf{80.32\%} \\
+Precision                                      & 61.30\%          & \textbf{68.61\%} \\
+Recall                                         & \textbf{99.63\%} & 98.91\% \\
+F1 Score                                       & 75.90\%          & \textbf{81.02\%} \\
+Parameters                                     & \textbf{29.3M}   & 41.4M \\
+\bottomrule
+\multicolumn{3}{l}{$^\dagger$ Computed by torchmetrics during training (pixel-weighted);
+see Section~\ref{sec:metrics}.} \\
+\end{tabular}
+\end{table}
+
+The results reveal an important split between the two models. The Attention U-Net achieves
+higher validation IoU (98.08\% versus 95.10\%), yet SwinUNet outperforms it on every
+macro-averaged test metric. This discrepancy arises from the difference between the two
+IoU computations described in Section~\ref{sec:metrics}. Validation IoU is
+pixel-weighted, so larger classes contribute more to the score; this benefits U-Net's
+strong local boundary precision on high-frequency characters. The class-balanced macro IoU
+computed at test time gives equal weight to every foreground class regardless of
+frequency, which penalises failure on rare characters equally with common ones.
+
+The fact that SwinUNet wins on all class-balanced test metrics despite losing on
+pixel-weighted validation IoU suggests that its global self-attention mechanism helps it
+discriminate between visually confusable characters---such as `O' vs.\ `0', `l' vs.\ `1',
+and `I' vs.\ `|'---that appear rarely and are essentially invisible in a pixel-weighted
+average but heavily penalised in a class-balanced one. The F1 scores (75.90\% for U-Net,
+81.02\% for SwinUNet) are consistent with this interpretation: the harmonic mean of
+precision and recall is sensitive to failures on both under-predicted and over-predicted
+classes, and SwinUNet's advantage of 5.12 percentage points on F1 mirrors its advantage
+on macro IoU and Dice, confirming a systematic improvement in class-level discrimination
+rather than a single-metric artefact. This finding has a methodological implication: for
+a long-tailed 80-class vocabulary, class-balanced macro IoU is a more informative
+evaluation metric than pixel-weighted IoU, and optimising directly for it (rather than
+using it only at test time) could further improve SwinUNet's advantage.
+
+Table~\ref{tab:v1v2} places version~2 in context by comparing the Attention U-Net against
+the version~1 baseline on aspects that can be meaningfully compared. The test-set IoU
+figures from the two versions are presented separately because they measure fundamentally
+different quantities and cannot be placed in the same column without misleading the
+reader: version~1 reported pixel-weighted IoU over bounding-box ground truth, while
+version~2 reports class-balanced macro IoU over glyph-contour ground truth with 80
+classes. The validation IoU figures are the only directly comparable numbers, as both use
+the same torchmetrics pixel-weighted computation on their respective validation sets.
+
+\begin{table}[H]
+\centering
+\caption{Version 1 vs.\ Version 2: Attention U-Net --- Pipeline Comparison}
+\label{tab:v1v2}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Aspect} & \textbf{Version 1} & \textbf{Version 2} \\
+\midrule
+Mask type              & Bounding-box fill       & Glyph-contour (binarise + AND) \\
+Character classes      & 75                      & 80 \\
+Training images        & 8,000                   & 12,000 \\
+Slant augmentation     & None                    & Render-time shear $[-0.4, 0.4]$ \\
+Morphological augm.    & None                    & Erosion, dilation, ink variation \\
+\midrule
+\multicolumn{3}{l}{\textit{Directly comparable}} \\
+\addlinespace[2pt]
+Best validation IoU (pixel-weighted) & 94.52\% & \textbf{98.08\%} \\
+\midrule
+\multicolumn{3}{l}{\textit{Not directly comparable --- different ground truth and metric}} \\
+\addlinespace[2pt]
+Test IoU (v1: pixel-weighted, bbox GT) & 91.31\% & --- \\
+Test IoU (v2: class-balanced, glyph GT) & --- & 61.20\% \\
+\midrule
+Real data evaluation   & None                    & IAM test split (1,861 images) \\
+Architecture(s)        & Attention U-Net         & Attention U-Net + SwinUNet \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Per-Group Analysis}
+
+Table~\ref{tab:per_group} breaks the class-balanced macro IoU down by character group.
+SwinUNet outperforms the Attention U-Net across all four groups without exception.
+
+\begin{table}[H]
+\centering
+\caption{Per-Group IoU on Synthetic Test Set (Class-Balanced Macro)}
+\label{tab:per_group}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Group} & \textbf{Attention U-Net} & \textbf{SwinUNet} \\
+\midrule
+Lowercase   & 76.38\% & \textbf{82.28\%} \\
+Uppercase   & 54.94\% & \textbf{64.06\%} \\
+Digits      & 49.51\% & \textbf{56.69\%} \\
+Special     & 47.74\% & \textbf{51.78\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Lowercase letters consistently achieve the highest IoU for both models, which follows
+directly from their high frequency in English text and therefore in the training data:
+more training examples per class leads to stronger per-class feature learning. Special
+characters and digits are the most challenging: special characters include rare punctuation
+with very few training samples, while digits suffer from structural similarity to letters
+(\eg `1'/`l', `0'/`O'). The performance ordering (lowercase $>$ uppercase $>$ digits $>$
+special) is consistent across both architectures and all three metrics, suggesting it
+reflects a genuine property of the task rather than a random artefact.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_synthetic_per_group_iou.png}
+        \caption{U-Net --- per-group IoU}
+        \label{fig:pg_syn_unet_iou}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_synthetic_per_group_iou.png}
+        \caption{SwinUNet --- per-group IoU}
+        \label{fig:pg_syn_swin_iou}
+    \end{subfigure}
+
+    \vspace{0.6em}
+
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_synthetic_per_group_dice.png}
+        \caption{U-Net --- per-group Dice}
+        \label{fig:pg_syn_unet_dice}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_synthetic_per_group_dice.png}
+        \caption{SwinUNet --- per-group Dice}
+        \label{fig:pg_syn_swin_dice}
+    \end{subfigure}
+
+    \vspace{0.6em}
+
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_synthetic_per_group_f1.png}
+        \caption{U-Net --- per-group F1}
+        \label{fig:pg_syn_unet_f1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_synthetic_per_group_f1.png}
+        \caption{SwinUNet --- per-group F1}
+        \label{fig:pg_syn_swin_f1}
+    \end{subfigure}
+
+    \caption{Per-group segmentation metrics on the synthetic test set for both
+    architectures across IoU (top), Dice (middle), and F1 (bottom). SwinUNet outperforms
+    Attention U-Net across all groups and all three metrics, with the largest absolute gap
+    in the uppercase group. The ordering lowercase $>$ uppercase $>$ digits $>$ special is
+    consistent across all metrics and both models. All metrics are class-balanced macro
+    averages within each group.}
+    \label{fig:per_group_synthetic}
+\end{figure}
+
+\subsubsection{Qualitative Results on Synthetic Data}
+
+Figure~\ref{fig:synthetic_predictions} shows representative model predictions on the
+synthetic test set alongside ground-truth masks and colour overlays. Both architectures
+produce visually accurate, well-aligned segmentations across diverse font styles and
+character densities. Figure~\ref{fig:confusion_synthetic} presents the corresponding
+normalised confusion matrices restricted to the top 30 most frequent classes. The strong
+diagonal confirms overall high accuracy. The most notable off-diagonal entries are between
+structurally similar pairs: `O'/`0', `l'/`1', and `I'/`|', which share visual features
+that are difficult to disambiguate without strong contextual cues. SwinUNet's confusion
+matrix shows a slightly stronger diagonal for these pairs, consistent with its better
+macro IoU on digits and special characters.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_synthetic_predictions.png}
+        \caption{Attention U-Net predictions on synthetic test samples.}
+        \label{fig:unet_syn_pred}
+    \end{subfigure}
+    \vspace{0.6em}
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_synthetic_predictions.png}
+        \caption{SwinUNet predictions on synthetic test samples.}
+        \label{fig:swin_syn_pred}
+    \end{subfigure}
+    \caption{Qualitative segmentation results on the synthetic test set. Each row shows
+    the input image, ground-truth mask, model prediction, and a colour overlay. Both
+    models achieve visually accurate character-level segmentation with precise
+    glyph-contour boundaries on the synthetic domain, consistent with the high
+    quantitative metrics in Table~\ref{tab:synthetic_results}.}
+    \label{fig:synthetic_predictions}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_synthetic_confusion_matrix.png}
+        \caption{Attention U-Net}
+        \label{fig:cm_unet_syn}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_synthetic_confusion_matrix.png}
+        \caption{SwinUNet}
+        \label{fig:cm_swin_syn}
+    \end{subfigure}
+    \caption{Normalised confusion matrices on the synthetic test set (top 30 classes by
+    frequency). Rows are true classes, columns are predicted classes. The strong diagonal
+    confirms high overall accuracy. Systematic off-diagonal confusion is concentrated on
+    visually similar pairs: `O'/`0', `l'/`1', and `I'/`|'. SwinUNet shows marginally
+    stronger diagonal entries for these ambiguous pairs, consistent with its higher macro
+    IoU on digits and special characters.}
+    \label{fig:confusion_synthetic}
+\end{figure}
+
+\subsection{IAM Handwriting Database Evaluation}
+
+\subsubsection{Quantitative Results}
+\label{sec:iam_quantitative}
+
+Table~\ref{tab:iam_results} presents the evaluation results on the IAM test split. The
+sharp contrast with Table~\ref{tab:synthetic_results} is the defining result of this
+work.
+
+\begin{table}[H]
+\centering
+\caption{IAM Test Set Performance (1,861 Line Images, Pseudo Ground Truth)}
+\label{tab:iam_results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Attention U-Net} & \textbf{SwinUNet} \\
+\midrule
+Pixel Accuracy & \textbf{87.01\%} & 84.48\% \\
+Macro IoU      & 0.16\%           & \textbf{0.26\%} \\
+Macro Dice     & 0.32\%           & \textbf{0.52\%} \\
+Precision      & 0.85\%           & \textbf{0.86\%} \\
+Recall         & \textbf{1.30\%}  & 1.01\% \\
+\bottomrule
+\multicolumn{3}{l}{\footnotesize Metrics use approximate pseudo ground-truth masks; see
+Section~\ref{sec:pseudo_masks}. Values underestimate true performance.} \\
+\end{tabular}
+\end{table}
+
+Pixel accuracy holds up reasonably well at 84--87\%, confirming that both models retain
+the ability to distinguish ink pixels from background on real handwriting images.
+Character-level discrimination, however, collapses entirely: macro IoU falls to
+0.16--0.26\%. To contextualise this figure, a uniform random classifier assigning one of
+79 foreground classes to each ink pixel would achieve an expected macro IoU of
+approximately $1/79 \approx 1.27\%$. Both models score \emph{below} this random baseline,
+which is not a sign of random failure but rather a sign of systematic class-bias: the
+models predict predominantly high-frequency lowercase classes for virtually all ink pixels,
+yielding near-zero IoU for the many classes they essentially never predict. This behaviour
+is directly visible in Figure~\ref{fig:iam_predictions}: the overlay column confirms that
+foreground ink regions are detected in roughly the correct spatial locations, but the
+colour-coded class labels assigned to those ink pixels do not match the true character
+identity. The models have learned where ink is, but not which character that ink
+represents when the handwriting domain departs from the synthetic training distribution.
+
+\subsubsection{Domain Gap Analysis}
+
+Table~\ref{tab:domain_gap} quantifies the performance degradation from the synthetic to
+the real domain for both architectures.
+
+\begin{table}[H]
+\centering
+\caption{Domain Gap: Synthetic Test Set vs.\ IAM Performance}
+\label{tab:domain_gap}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{Synthetic} & \textbf{IAM} & \textbf{Relative Drop} \\
+\midrule
+\multicolumn{4}{l}{\textit{Attention U-Net}} \\
+\addlinespace[2pt]
+Pixel Accuracy & 98.59\% & 87.01\% & $-11.7\%$ \\
+Macro IoU      & 61.20\% & 0.16\%  & $-99.7\%$ \\
+Macro Dice     & 75.07\% & 0.32\%  & $-99.6\%$ \\
+\midrule
+\multicolumn{4}{l}{\textit{SwinUNet}} \\
+\addlinespace[2pt]
+Pixel Accuracy & 99.03\% & 84.48\% & $-14.7\%$ \\
+Macro IoU      & 68.20\% & 0.26\%  & $-99.6\%$ \\
+Macro Dice     & 80.32\% & 0.52\%  & $-99.3\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The two-tier degradation pattern is the central empirical finding of this work. Pixel
+accuracy drops by 12--15\%---substantial but recoverable---while class-level metrics drop
+by over 99\% in both cases. This dissociation directly reveals the structure of what is
+and is not learned from synthetic font-rendered training data: low-level ink-detection
+features (intensity gradients, stroke edges) are general enough to transfer to real
+handwriting, but the higher-level character-identity features are so deeply coupled to
+the smooth, consistent appearance of font-rendered glyphs that they cannot recognise the
+same characters when drawn with natural pen variation.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_domain_gap_chart.png}
+        \caption{Attention U-Net}
+        \label{fig:gap_unet}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_domain_gap_chart.png}
+        \caption{SwinUNet}
+        \label{fig:gap_swin}
+    \end{subfigure}
+    \caption{Domain gap visualisation: synthetic test set vs.\ IAM performance across all
+    metrics for both architectures. The two-tier structure is clearly visible: pixel
+    accuracy degrades moderately while all character-class metrics collapse to near zero,
+    confirming that the domain gap affects class-identity features far more severely than
+    low-level ink-detection features.}
+    \label{fig:domain_gap_charts}
+\end{figure}
+
+\subsubsection{Per-Group Domain Gap}
+
+Tables~\ref{tab:group_gap} and~\ref{tab:group_gap_swin} show the per-group IoU comparison
+for both architectures. The pattern is uniform: near-complete collapse in every character
+group without exception.
+
+\begin{table}[H]
+\centering
+\caption{Per-Group IoU Domain Gap (Attention U-Net)}
+\label{tab:group_gap}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Group} & \textbf{Synthetic IoU} & \textbf{IAM IoU} & \textbf{Absolute Drop} \\
+\midrule
+Lowercase & 76.38\% & 0.37\% & $-76.01$ pp \\
+Uppercase & 54.94\% & 0.04\% & $-54.90$ pp \\
+Digits    & 49.51\% & 0.00\% & $-49.51$ pp \\
+Special   & 47.74\% & 0.04\% & $-47.70$ pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Per-Group IoU Domain Gap (SwinUNet)}
+\label{tab:group_gap_swin}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Group} & \textbf{Synthetic IoU} & \textbf{IAM IoU} & \textbf{Absolute Drop} \\
+\midrule
+Lowercase & 82.28\% & 0.70\% & $-81.58$ pp \\
+Uppercase & 64.06\% & 0.00\% & $-64.06$ pp \\
+Digits    & 56.69\% & 0.00\% & $-56.69$ pp \\
+Special   & 51.78\% & 0.00\% & $-51.78$ pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Lowercase letters retain the highest residual IAM IoU in both models (0.37\% for U-Net,
+0.70\% for SwinUNet). While negligible in absolute terms, this is consistent with two
+reinforcing factors: lowercase characters are the most frequent class in English text and
+therefore receive the most training examples, and the basic forms of common lowercase
+letters (\eg `a', `e', `o', `n') are among the least idiosyncratic across writers, making
+them somewhat more recognisable across the synthetic-to-real boundary. Digits and
+uppercase letters in contrast collapse to exactly 0.00\% IAM IoU, indicating complete
+failure of class-level discrimination for these groups on real handwriting.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_iam_per_group_iou.png}
+        \caption{U-Net --- per-group IoU}
+        \label{fig:pg_iam_unet_iou}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_iam_per_group_iou.png}
+        \caption{SwinUNet --- per-group IoU}
+        \label{fig:pg_iam_swin_iou}
+    \end{subfigure}
+
+    \vspace{0.6em}
+
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_iam_per_group_dice.png}
+        \caption{U-Net --- per-group Dice}
+        \label{fig:pg_iam_unet_dice}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_iam_per_group_dice.png}
+        \caption{SwinUNet --- per-group Dice}
+        \label{fig:pg_iam_swin_dice}
+    \end{subfigure}
+
+    \vspace{0.6em}
+
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/unet_iam_per_group_f1.png}
+        \caption{U-Net --- per-group F1}
+        \label{fig:pg_iam_unet_f1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/swin_iam_per_group_f1.png}
+        \caption{SwinUNet --- per-group F1}
+        \label{fig:pg_iam_swin_f1}
+    \end{subfigure}
+
+    \caption{Per-group segmentation metrics on the IAM real handwriting test set for both
+    architectures across IoU (top), Dice (middle), and F1 (bottom). Near-complete collapse
+    is observed across every character group, with lowercase retaining a marginal edge
+    consistent with its higher training frequency and lower writer-to-writer variability.
+    The agreement of all three metrics confirms that the domain gap is not an artefact of
+    any single measure.}
+    \label{fig:per_group_iam}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/unet_iam_predictions.png}
+    \caption{Attention U-Net predictions on IAM real handwriting samples (columns: input
+    image, pseudo ground-truth mask, model prediction, colour overlay). The overlay
+    confirms that foreground ink regions are detected in spatially correct locations,
+    indicating that low-level ink-detection features transfer from synthetic training.
+    However, the predicted class labels---visible as the colour pattern in the prediction
+    column---do not match the pseudo ground truth. The model assigns ink pixels
+    predominantly to high-frequency lowercase classes from the synthetic training
+    distribution, irrespective of the actual character identity at each position. This
+    behaviour explains the near-zero macro IoU alongside the reasonable pixel accuracy:
+    the model has learned \emph{where} ink is but has not learned \emph{which character}
+    that ink represents in the real handwriting domain.}
+    \label{fig:iam_predictions}
+\end{figure}
+
+% =============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =============================================================================
+
+\subsection{Key Findings}
+
+\subsubsection{Pixel-Level Masks Correct a Fundamental Training Objective Mismatch}
+
+The shift from bounding-box fills to glyph-contour masks is the most structurally
+significant change in this version, because it corrects what the model is trained to
+predict. Version~1 assigned a rectangular fill to every character region: the model
+optimised its predictions to match these boxes, which is a well-defined but wrong task.
+The glyph-contour masks in version~2 assign class labels only to ink pixels, so the model
+learns to predict the shape of the character as it actually appears.
+
+The measurable consequence is visible in the validation IoU: 94.52\% in version~1 versus
+98.08\% in version~2 for the Attention U-Net. It is not possible to attribute this gain to
+the mask change alone, because the augmentation pipeline, class weighting scheme, and
+present-class-only Dice averaging were all introduced simultaneously. However, the
+expected contribution of each change can be reasoned about qualitatively. The mask quality
+change is fundamental---it alters the ground truth that every gradient update optimises
+toward, so its effect compounds across all training steps. The augmentation pipeline is a
+regularisation improvement, primarily relevant to generalisation rather than peak
+in-distribution accuracy. The class weighting and Dice averaging changes affect how
+gradient signals are balanced across the 80 classes, improving the signal quality for
+rare classes. On balance, the mask correction is expected to be the largest contributor
+to the validation IoU improvement.
+
+\subsubsection{SwinUNet Provides Better Class Discrimination on a Long-Tailed Vocabulary}
+
+A counterintuitive result is that the model with lower validation IoU (SwinUNet, 95.10\%)
+consistently outperforms the model with higher validation IoU (Attention U-Net, 98.08\%)
+on every class-balanced test metric. This is not a contradiction---it is a direct
+consequence of the metric inconsistency between training and evaluation described in
+Section~\ref{sec:metrics}.
+
+The deeper finding is that the two architectures optimise for qualitatively different
+objectives under the same training protocol. The Attention U-Net's convolutional inductive
+bias makes it excellent at learning precise local boundary features, which yields high
+scores on pixel-weighted metrics dominated by the most frequent classes. SwinUNet's global
+self-attention enables it to use long-range context---the surrounding characters and word
+shape---when classifying each character position. This is exactly the kind of information
+that disambiguates confusable character pairs (\eg `l' vs.\ `1') that appear at low
+frequency and are penalised heavily in a class-balanced average.
+
+This finding suggests that for long-tailed multi-class segmentation tasks, the choice of
+evaluation metric is as consequential as the choice of architecture. A practitioner
+optimising for pixel-weighted validation IoU would select the Attention U-Net; a
+practitioner optimising for class-balanced macro IoU---which better reflects performance
+across the full vocabulary---would select SwinUNet.
+
+\subsubsection{The Synthetic-to-Real Gap is Severe and Structurally Two-Tiered}
+
+The IAM results establish the most significant finding of this project: both architectures
+learn two qualitatively distinct types of representation from synthetic training data, and
+only one type transfers to real handwriting.
+
+The first type is \emph{ink localisation}: discriminating ink pixels from background.
+This is a low-level intensity-based task. The features that solve it---local intensity
+gradients, edge responses, stroke boundaries---are largely invariant to the specific
+character being written and to the difference between font-rendered and pen-drawn
+appearance. Pixel accuracy degrades by only 12--15\% on real handwriting, confirming that
+this type of representation transfers.
+
+The second type is \emph{character identity}: assigning the correct class label to each
+ink region. This requires recognising the specific shape signature of each character. The
+features that solve it in the synthetic domain are trained on smooth, perfectly consistent
+font-rendered glyphs, where the same character looks identical at every occurrence. Real
+handwriting produces each character instance through a pen trajectory under variable
+pressure, speed, and motor noise, resulting in local stroke variations, natural
+irregularities at junctions and endpoints, and writer-specific idiosyncrasies that are
+entirely absent from the training distribution. Character-level macro IoU collapses by
+over 99\%, confirming that these identity features do not transfer at all.
+
+The two-tier structure of the gap is itself a scientifically useful result. It precisely
+isolates the bottleneck: the problem is not that the models fail to find the ink, but that
+they cannot identify what character the ink represents once it is found. Any practical
+solution must address this second layer specifically.
+
+\subsection{Limitations}
+
+\subsubsection{Approximate IAM Ground Truth}
+\label{sec:approx_gt}
+
+The pseudo ground-truth masks generated via connected component analysis are inherently
+imperfect. Touching characters merge into a single component; multi-stroke characters
+(\eg `i', `j', `t') produce multiple components that may not align with the transcription
+sequence; and reading-order ambiguities arise at line boundaries. All of these introduce
+noise into the evaluation masks. The reported IAM metrics consequently underestimate
+actual model performance by an unknown amount. True IAM evaluation would require manual
+pixel-level annotation, which does not currently exist for the database. The IAM numbers
+should therefore be interpreted as lower bounds on real-data performance rather than exact
+accuracy figures.
+
+\subsubsection{Font Rendering vs.\ Natural Stroke Variation}
+
+Even with the extended augmentation pipeline, the synthetic training data is fundamentally
+font-rendered. Fonts define character shapes as smooth B\'{e}zier curves rendered
+identically at every occurrence of the same character, in the same font, at the same size.
+Real handwriting produces each character instance from a unique continuous pen trajectory,
+yielding local stroke texture, natural irregularities at junctions and endpoints, and
+ligatures between connected letters. The slant augmentation successfully introduces
+cursive angle variation, and elastic deformation introduces global waviness, but neither
+replicates the within-stroke microstructure that characterises handwritten glyphs. This is
+the root cause of the domain gap and cannot be fully resolved through post-hoc image
+augmentation of font-rendered output.
+
+\subsubsection{Metric Inconsistency Between Training and Evaluation}
+\label{sec:metric_inconsistency}
+
+The model is optimised by early stopping for pixel-weighted validation IoU, but the
+primary evaluation metric at test time is class-balanced macro IoU. These two quantities
+can favour different model checkpoints. Concretely, the best checkpoint under
+pixel-weighted validation IoU is not guaranteed to be the best checkpoint under
+class-balanced macro IoU. This means the reported test results may not represent the best
+achievable performance under the test metric---a model selected by a different criterion
+could score higher on the class-balanced evaluation. Harmonising the training-time and
+test-time metrics by periodically computing the full confusion-matrix macro IoU during
+training, and using it directly as the early stopping criterion, would address this
+inconsistency and is a straightforward improvement requiring no change to architecture or
+data.
+
+\subsection{Future Work}
+
+\subsubsection{Domain Adaptation}
+
+The most impactful next step is to directly address the synthetic-to-real gap at the
+representation level. Adversarial domain adaptation---training a domain discriminator
+alongside the segmentation model to align feature distributions between synthetic and real
+images---could transfer character-identity knowledge learned from synthetic data to real
+handwriting without requiring real pixel-level annotations. Alternatively, collecting even
+a modest number of manually annotated real handwriting lines (100--200 images) for
+fine-tuning could close much of the gap through targeted supervised learning, leveraging
+the strong synthetic pre-training as initialisation.
+
+\subsubsection{Stroke-Level Synthetic Generation}
+
+Replacing font rendering with a stroke-level handwriting synthesis model would produce
+training data that more closely mirrors the real handwriting distribution at the source.
+Models that generate pen trajectories conditioned on character identity produce diverse,
+naturalistic character instances whose within-stroke microstructure is far closer to what
+a human writer produces. This would reduce the domain gap at the data level rather than
+attempting to close it through augmentation or adaptation after the fact.
+
+\subsubsection{Hybrid Architecture}
+
+The complementary strengths observed in this comparison---U-Net's precise local boundary
+detection versus SwinUNet's global class discrimination---motivate a hybrid design
+combining a CNN encoder with a transformer decoder. Architectures such as TransUNet or
+HiFormer explore exactly this combination. In the context of this task, a CNN encoder
+could provide rich local stroke features to the decoder, while a transformer decoder could
+use global context across the character sequence to resolve class ambiguity.
+
+\subsubsection{Harmonised Evaluation}
+
+Aligning the training-time validation metric with the test-time evaluation metric would
+ensure that model selection via early stopping optimises for the quantity reported at
+evaluation. Running the full confusion-matrix class-balanced macro IoU periodically during
+training---rather than only at test time---would provide a more reliable basis for both
+early stopping and hyperparameter tuning, and would likely further improve SwinUNet's
+already superior class-balanced test performance.
+
+% =============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% =============================================================================
+
+This project directly addressed all three improvements requested following the version~1
+review---pixel-level glyph-contour masks, a comprehensive augmentation pipeline with
+explicit real-handwriting motivation for each transform, and quantitative evaluation on
+real handwriting from the IAM database---and extended the work with a controlled
+two-architecture comparison between Attention U-Net and SwinUNet.
+
+Three findings stand out. First, the glyph-contour masks correct a fundamental training
+objective mismatch from version~1, contributing to a validation IoU improvement from
+94.52\% to 98.08\% for the Attention U-Net. Second, the architecture comparison reveals
+a meaningful trade-off: Attention U-Net achieves higher pixel-weighted validation IoU,
+while SwinUNet achieves higher class-balanced macro IoU on all test metrics, suggesting
+that global self-attention better handles the long-tailed 80-class vocabulary. Third, and
+most significantly, the IAM evaluation reveals a structurally two-tiered domain gap:
+pixel accuracy holds at 84--87\% on real handwriting, confirming partial transfer of
+low-level ink-detection features, while character-class macro IoU collapses below 0.3\%,
+confirming near-total failure of character-identity features to generalise beyond the
+synthetic domain.
+
+This last finding is a precisely characterised negative result with direct scientific
+value: it establishes a clear, reproducible lower bound on the current approach and
+isolates exactly where the failure occurs. The models are effective text detectors but not
+character classifiers when evaluated on real handwriting. Addressing this gap requires
+either closing the distance between synthetic and real training distributions (through
+stroke-level synthesis or domain adaptation) or providing a modest amount of real
+annotated data for fine-tuning. The complete codebase, with centralised configuration,
+W\&B experiment tracking, and separate evaluation tools for synthetic and real data, is
+structured to support exactly these next steps.
+
+% =============================================================================
+% References
+% =============================================================================
+
+\newpage
+\begin{thebibliography}{10}
+
+\bibitem{ronneberger2015}
+O.~Ronneberger, P.~Fischer, and T.~Brox,
+``U-Net: Convolutional Networks for Biomedical Image Segmentation,''
+\textit{Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
+vol.~9351, pp.~234--241, 2015.
+
+\bibitem{oktay2018}
+O.~Oktay, J.~Schlemper, L.~L.~Folgoc, \emph{et al.},
+``Attention U-Net: Learning Where to Look for the Pancreas,''
+\textit{Medical Imaging with Deep Learning (MIDL)}, 2018.
+
+\bibitem{cao2022}
+H.~Cao, Y.~Wang, J.~Chen, \emph{et al.},
+``Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation,''
+\textit{ECCV Workshop on Computer Vision for Automated Medical Diagnosis}, 2022.
+
+\bibitem{liu2021}
+Z.~Liu, Y.~Lin, Y.~Cao, \emph{et al.},
+``Swin Transformer: Hierarchical Vision Transformer using Shifted Windows,''
+\textit{IEEE/CVF International Conference on Computer Vision (ICCV)},
+pp.~10012--10022, 2021.
+
+\bibitem{marti2002}
+U.-V.~Marti and H.~Bunke,
+``The IAM-database: An English Sentence Database for Offline Handwriting Recognition,''
+\textit{International Journal on Document Analysis and Recognition},
+vol.~5, no.~1, pp.~39--46, 2002.
+
+\bibitem{loshchilov2019}
+I.~Loshchilov and F.~Hutter,
+``Decoupled Weight Decay Regularization,''
+\textit{International Conference on Learning Representations (ICLR)}, 2019.
+
+\bibitem{sudre2017}
+C.~H.~Sudre, W.~Li, T.~Vercauteren, S.~Ourselin, and M.~J.~Cardoso,
+``Generalised Dice Overlap as a Deep Learning Loss Function for Highly Unbalanced
+Segmentations,''
+\textit{Deep Learning in Medical Image Analysis (DLMIA)},
+vol.~10553, pp.~240--248, 2017.
+
+\bibitem{paszke2019}
+A.~Paszke, S.~Gross, F.~Massa, \emph{et al.},
+``PyTorch: An Imperative Style, High-Performance Deep Learning Library,''
+\textit{Advances in Neural Information Processing Systems (NeurIPS)},
+vol.~32, pp.~8024--8035, 2019.
+
+\bibitem{falcon2019}
+W.~Falcon and {The PyTorch Lightning team},
+``PyTorch Lightning,''
+version~2.1.4, available at \url{https://github.com/Lightning-AI/pytorch-lightning},
+2019.
+
+\bibitem{wandb2020}
+L.~Biewald,
+``Experiment Tracking with Weights and Biases,''
+Software available from \url{https://wandb.com}, 2020.
+
+\bibitem{albumentations2020}
+A.~Buslaev, V.~I.~Iglovikov, E.~Khvedchenya, \emph{et al.},
+``Albumentations: Fast and Flexible Image Augmentations,''
+\textit{Information}, vol.~11, no.~2, p.~125, 2020.
+
+\end{thebibliography}
+
+% =============================================================================
+% Declaration of Authorship
+% =============================================================================
+
+\newpage
+\thispagestyle{empty}
+\section*{Declaration of Authorship}
+
+I confirm that I have written this report unaided and without using sources other than
+those listed, and that this report has never been submitted to another examination
+authority and accepted as part of an examination achievement, neither in this form nor in
+a similar form. All content taken from a third party, either verbatim or in substance,
+has been acknowledged as such.
+
+\vspace{3cm}
+
+\noindent
+Erlangen, 18th~March~2026 \hfill Fahad Tariq
+
+\end{document}
